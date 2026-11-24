@@ -87,9 +87,12 @@ const CinemaGradeShader = {
 
 export function createPostProcessing(renderer, scene, camera, width, height) {
   // Multisampled HalfFloat HDR render target for silky anti-aliased metallic chamfers
+  // Optional ?msaa=0 query flag allows fast software-WebGL offline MP4 rendering
+  const params = new URLSearchParams(window.location.search);
+  const samples = params.get('msaa') === '0' ? 0 : 4;
   const rt = new THREE.WebGLRenderTarget(width, height, {
     type: THREE.HalfFloatType,
-    samples: 4,
+    samples,
   });
 
   const composer = new EffectComposer(renderer, rt);

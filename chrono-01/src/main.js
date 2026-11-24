@@ -1,5 +1,5 @@
 // CHRONO // 01 — 20.00s 60fps 16:9 Pure-Code 3D Luxury Watch Commercial
-// Entrypoint, Cinema Presentation Shell, Audio Sync & Deterministic Time Controller
+// Entrypoint, Cinema Presentation Shell, Non-Blocking Audio Sync & Deterministic Time Controller
 
 import * as THREE from 'three';
 import { createProceduralTextures } from './textures.js';
@@ -7,7 +7,7 @@ import { buildStudioEnvironment, createStudioLights } from './studio.js';
 import { buildWatchAssembly } from './watchGeometry.js';
 import { createPostProcessing } from './postfx.js';
 import { createTimelineController, DURATION } from './timeline.js';
-import { prerenderSoundtrack } from './audio.js';
+import { buildAudioBuffer } from './audio.js';
 import { clamp } from './prng.js';
 
 function boot() {
@@ -55,7 +55,6 @@ function boot() {
 
   const lights = createStudioLights(scene);
 
-  // Determine initial stage dimensions
   const getStageSize = () => {
     const rect = stage.getBoundingClientRect();
     const w = Math.max(320, Math.round(rect.width));
@@ -65,7 +64,13 @@ function boot() {
 
   const initSize = getStageSize();
   renderer.setSize(initSize.w, initSize.h, false);
-  const postfx = createPostProcessing(renderer, scene, camera, Math.round(initSize.w * dpr), Math.round(initSize.h * dpr));
+  const postfx = createPostProcessing(
+    renderer,
+    scene,
+    camera,
+    Math.round(initSize.w * dpr),
+    Math.round(initSize.h * dpr)
+  );
 
   // Typography update callback (pure function of t from timeline.js)
   const updateTypography = ({ titleAlpha, tagAlpha, lineScale }) => {
@@ -87,7 +92,7 @@ function boot() {
     onTypographyUpdate: updateTypography,
   });
 
-  // 3. Resize Observer (keeps crisp 16:9 letterboxed resolution at any window size)
+  // 3. Resize Observer
   const handleResize = () => {
     const { w, h } = getStageSize();
     renderer.setSize(w, h, false);
@@ -98,31 +103,25 @@ function boot() {
   };
   window.addEventListener('resize', handleResize);
 
-  // 4. Web Audio Engine State (Pre-rendered 20.00s stereo buffer on first user gesture)
+  // 4. Instant Non-Blocking Web Audio Engine (never freezes video playback!)
   let audioCtx = null;
   let soundtrackBuffer = null;
   let activeSource = null;
-  let audioLoadingPromise = null;
-  let audioStartWallCtxTime = 0;
-  let audioStartOffset = 0;
 
-  async function ensureAudioReady() {
-    if (!audioCtx) {
-      const Ctx = window.AudioContext || window.webkitAudioContext;
-      if (!Ctx) return null;
-      audioCtx = new Ctx({ sampleRate: 44100 });
+  function ensureAudioContext() {
+    try {
+      if (!audioCtx) {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return null;
+        audioCtx = new Ctx();
+      }
+      if (!soundtrackBuffer) {
+        soundtrackBuffer = buildAudioBuffer(audioCtx);
+      }
+      return audioCtx;
+    } catch (_) {
+      return null;
     }
-    if (audioCtx.state === 'suspended') {
-      await audioCtx.resume();
-    }
-    if (soundtrackBuffer) return soundtrackBuffer;
-    if (!audioLoadingPromise) {
-      audioLoadingPromise = prerenderSoundtrack().then((buf) => {
-        soundtrackBuffer = buf;
-        return buf;
-      });
-    }
-    return audioLoadingPromise;
   }
 
   function stopAudioSource() {
@@ -137,15 +136,27 @@ function boot() {
 
   function startAudioAt(offsetSec) {
     stopAudioSource();
-    if (!audioCtx || !soundtrackBuffer) return;
-    const clamped = clamp(offsetSec, 0, DURATION - 0.02);
-    const src = audioCtx.createBufferSource();
-    src.buffer = soundtrackBuffer;
-    src.connect(audioCtx.destination);
-    audioStartWallCtxTime = audioCtx.currentTime;
-    audioStartOffset = clamped;
-    src.start(0, clamped);
-    activeSource = src;
+    const ctx = ensureAudioContext();
+    if (!ctx || !soundtrackBuffer) return;
+
+    const launch = () => {
+      if (!isPlaying) return;
+      stopAudioSource();
+      const liveOffset = clamp(currentTime, 0, DURATION - 0.02);
+      try {
+        const src = ctx.createBufferSource();
+        src.buffer = soundtrackBuffer;
+        src.connect(ctx.destination);
+        src.start(0, liveOffset);
+        activeSource = src;
+      } catch (_) {}
+    };
+
+    if (ctx.state === 'suspended') {
+      ctx.resume().then(launch).catch(() => {});
+    } else {
+      launch();
+    }
   }
 
   // 5. Playback & Deterministic Scrubbing State
@@ -153,7 +164,6 @@ function boot() {
   let isPlaying = false;
   let playAnchorPerf = 0;
   let playAnchorTime = 0;
-  let hasStartedOnce = false;
 
   function formatTime(sec) {
     const s = clamp(sec, 0, DURATION);
@@ -175,21 +185,19 @@ function boot() {
     updateHUD(currentTime);
   }
 
-  async function playFrom(startSec = currentTime) {
+  function playFrom(startSec = currentTime) {
     const target = startSec >= DURATION - 0.04 ? 0.0 : clamp(startSec, 0, DURATION);
-    hasStartedOnce = true;
     playOverlay.classList.add('hidden');
     stage.classList.remove('initial-paused');
 
-    // Unlock & pre-render stereo soundtrack cleanly (takes ~120ms once, cached thereafter)
-    try {
-      await ensureAudioReady();
-    } catch (_) {}
-
+    // Start video playback IMMEDIATELY with zero async blocking!
     currentTime = target;
     playAnchorTime = target;
     playAnchorPerf = performance.now();
     isPlaying = true;
+    drawFrame(target);
+
+    // Unlock and start synchronized stereo soundtrack non-blockingly
     startAudioAt(target);
   }
 
@@ -207,7 +215,6 @@ function boot() {
 
   function seekTo(sec, keepPlaying = false) {
     const target = clamp(sec, 0, DURATION);
-    hasStartedOnce = true;
     playOverlay.classList.add('hidden');
     stage.classList.remove('initial-paused');
     currentTime = target;
@@ -222,7 +229,7 @@ function boot() {
     }
   }
 
-  // Expose exact deterministic seek hook for automated capture & inspection
+  // Deterministic seek hooks for automated capture & inspection
   window.__setTime = (sec) => {
     const num = Number(sec);
     if (!Number.isFinite(num)) return currentTime;
@@ -230,13 +237,18 @@ function boot() {
     seekTo(num, false);
     return currentTime;
   };
-
   window.__play = () => playFrom(currentTime);
   window.__pause = () => pause();
 
   // 6. Minimal Cinema Controls
-  playBtn.addEventListener('click', () => {
+  playBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
     playFrom(currentTime >= DURATION - 0.04 ? 0.0 : currentTime);
+  });
+
+  // Also allow clicking anywhere on the initial play overlay to start cleanly
+  playOverlay.addEventListener('click', () => {
+    playFrom(0.0);
   });
 
   // Hover scrub bar dragging
@@ -274,7 +286,7 @@ function boot() {
   scrubTrack.addEventListener('pointerup', endScrub);
   scrubTrack.addEventListener('pointercancel', endScrub);
 
-  // Keyboard shortcuts: Space (play/pause), R (replay), Left/Right (±0.25s deterministic step)
+  // Keyboard shortcuts: Space (play/pause), R (replay), Left/Right (±0.25s)
   window.addEventListener('keydown', (e) => {
     if (e.code === 'Space') {
       e.preventDefault();
@@ -295,17 +307,13 @@ function boot() {
     }
   });
 
-  // 7. URL ?t= Parameter Support (immediate deterministic seek & clean frame)
+  // 7. URL ?t= Parameter Support
   const params = new URLSearchParams(window.location.search);
   const queryT = params.get('t');
   if (queryT !== null && queryT !== '' && Number.isFinite(Number(queryT))) {
     hudBar.classList.add('capture-hidden');
     seekTo(Number(queryT), false);
   } else {
-    // Show poised opening obsidian frame at t = 1.15s behind the minimal Play button?
-    // Or t = 0.00s? Showing a subtle dramatic glint preview at t = 1.45s behind the quiet play button
-    // makes the opening screen immediately look like a luxury Swiss horology film!
-    // When Play is clicked, playback starts cleanly from t = 0.00s!
     timeline.renderAt(1.45);
     postfx.composer.render();
     currentTime = 0.0;
@@ -313,23 +321,16 @@ function boot() {
     stage.classList.add('initial-paused');
   }
 
-  // 8. 60fps Master Animation Loop (locked to AudioContext clock when audio is active for sample-exact sync!)
+  // 8. Rock-Solid 60fps Monotonic Master Loop (never freezes even if browser suspends audio)
   function tick() {
     requestAnimationFrame(tick);
     if (!isPlaying) return;
 
-    let nextT;
-    if (audioCtx && activeSource && audioCtx.state === 'running') {
-      nextT = audioStartOffset + (audioCtx.currentTime - audioStartWallCtxTime);
-    } else {
-      nextT = playAnchorTime + (performance.now() - playAnchorPerf) / 1000.0;
-    }
-
+    const nextT = playAnchorTime + (performance.now() - playAnchorPerf) / 1000.0;
     if (nextT >= DURATION) {
       drawFrame(DURATION);
       isPlaying = false;
       stopAudioSource();
-      // Gently offer replay on hover / Space / R while holding the pristine Shot 08 hero frame
       return;
     }
 
